@@ -1,0 +1,782 @@
+# ================================================================
+# ANE2_3000dataset_FINAL_PPT.py
+# Final tuned LightGBM analysis for PPT/report
+# Includes:
+# 1. Feature loading + scaling + balancing
+# 2. UMAP + PCA feature-space plots
+# 3. PCA explained variance analysis
+# 4. Tuned LightGBM training
+# 5. Train/validation loss, accuracy, error curves
+# 6. Final metrics + pastel confusion matrix + ROC
+# 7. Model comparison with speed + size
+# 8. SHAP explainability + human-readable explanations
+# ================================================================
+
+import os
+import time
+import pickle
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    classification_report,
+    roc_auc_score,
+    confusion_matrix,
+    roc_curve,
+    balanced_accuracy_score,
+    accuracy_score,
+    f1_score
+)
+from sklearn.utils import resample
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+
+import lightgbm as lgb
+import shap
+import umap
+from xgboost import XGBClassifier
+
+from FEATURE_PIPELINE_v4 import load_features
+
+# ================================================================
+# CONFIG
+# ================================================================
+
+TRAIN_PATH = "features_train_3000dataset.npz"
+TEST_PATH  = "features_test_3000dataset.npz"
+OUTPUT_DIR = "results_3000dataset_final_ppt"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+RANDOM_STATE = 42
+
+# Set True only if you want to rerun RandomizedSearchCV again.
+# Since tuning is already done, this is False to save time.
+RUN_HYPERPARAM_TUNING = False
+
+BEST_PARAMS = {
+    "subsample": 0.9,
+    "reg_lambda": 0.1,
+    "reg_alpha": 0.1,
+    "num_leaves": 31,
+    "n_estimators": 500,
+    "min_child_samples": 20,
+    "max_depth": -1,
+    "learning_rate": 0.05,
+    "colsample_bytree": 0.8,
+}
+
+# Pastel plot palette
+PASTEL_BLUE = "#8ECAE6"
+PASTEL_PINK = "#FFB3C6"
+DEEP_BLUE = "#219EBC"
+DEEP_PINK = "#D45087"
+DARK = "#22223B"
+GRID = "#D8D8D8"
+
+# ================================================================
+# HELPER FUNCTIONS
+# ================================================================
+
+def temporal_pool(x):
+    """Convert sequence feature (T,D) to video-level vector using mean/std/max."""
+    return np.concatenate([
+        x.mean(axis=0),
+        x.std(axis=0),
+        np.max(x, axis=0)
+    ], axis=0)
+
+
+def build_feature_matrix(feats):
+    """Build final fused feature matrix from saved .npz features."""
+    groups = {}
+
+    groups["spatial"] = np.array([temporal_pool(x) for x in feats["spatial"]])
+    groups["lips"]    = np.array([temporal_pool(x) for x in feats["lips"]])
+    groups["eyes"]    = np.array([temporal_pool(x) for x in feats["eyes"]])
+
+    groups["spatial_delta"] = np.array([temporal_pool(x) for x in feats["spatial_delta"]])
+    groups["lips_delta"]    = np.array([temporal_pool(x) for x in feats["lips_delta"]])
+    groups["eyes_delta"]    = np.array([temporal_pool(x) for x in feats["eyes_delta"]])
+    groups["audio_delta"]   = np.array([temporal_pool(x) for x in feats["mfcc_delta"]])
+
+    groups["audio"]    = np.array([temporal_pool(x) for x in feats["mfcc"]])
+    groups["joint_av"] = np.array([temporal_pool(x) for x in feats["joint_av"]])
+
+    flow = feats["optical_flow"]
+    groups["flow"] = np.column_stack([
+        flow.mean(axis=1),
+        flow.std(axis=1),
+        flow.max(axis=1)
+    ])
+
+    groups["ear_temporal"] = np.array([
+        temporal_pool(x.reshape(-1, 1)) for x in feats["ear_temporal"]
+    ])
+
+    groups["lip_temporal"] = np.array([
+        temporal_pool(x.reshape(-1, 1)) for x in feats["lip_temporal"]
+    ])
+
+    groups["scalars"] = np.column_stack([
+        feats["blink_rate"],
+        feats["mean_ear"],
+        feats["std_ear"],
+        feats["min_ear"],
+        feats["mean_lip_open"],
+        feats["std_lip_open"],
+        feats["max_lip_open"],
+        feats["av_sync_score"],
+    ])
+
+    X = np.concatenate(list(groups.values()), axis=1).astype(np.float32)
+    return X, groups
+
+
+def get_feature_names(groups):
+    names = []
+    for k, v in groups.items():
+        for i in range(v.shape[1]):
+            names.append(f"{k}_{i}")
+    return names
+
+
+def save_pastel_confusion_matrix(cm, labels, path, title="Confusion Matrix"):
+    """Save pastel pink/blue confusion matrix."""
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    pastel_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "pastel_blue_pink", ["#F8F0F4", PASTEL_BLUE, PASTEL_PINK, DEEP_PINK]
+    )
+    im = ax.imshow(cm, cmap=pastel_cmap)
+
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Predicted Label")
+    ax.set_ylabel("True Label")
+    ax.set_title(title, color=DARK, fontweight="bold")
+
+    threshold = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            color = "white" if cm[i, j] > threshold else DARK
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
+                    color=color, fontsize=14, fontweight="bold")
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+# ================================================================
+# STEP 1 — LOAD FEATURES
+# ================================================================
+
+print("=" * 60)
+print("STEP 1: Loading features")
+print("=" * 60)
+
+train_feats = load_features(TRAIN_PATH)
+test_feats  = load_features(TEST_PATH)
+
+y_train_original = train_feats["labels"].astype(int)
+y_test = test_feats["labels"].astype(int)
+
+print(f"\nOriginal TRAIN — Real: {(y_train_original == 0).sum()} | Fake: {(y_train_original == 1).sum()}")
+print(f"TEST           — Real: {(y_test == 0).sum()} | Fake: {(y_test == 1).sum()}")
+
+# ================================================================
+# STEP 2 — BUILD FEATURE MATRIX
+# ================================================================
+
+print("\nSTEP 2: Building feature matrices")
+
+X_train_full_original, train_groups_original = build_feature_matrix(train_feats)
+X_test_full, test_groups = build_feature_matrix(test_feats)
+feature_names = get_feature_names(train_groups_original)
+
+print(f"Original train feature shape: {X_train_full_original.shape}")
+print(f"Test feature shape: {X_test_full.shape}")
+print(f"Number of fused features: {len(feature_names)}")
+
+# ================================================================
+# STEP 3 — SCALING
+# ================================================================
+
+print("\nSTEP 3: Scaling")
+
+scaler = StandardScaler()
+X_train_scaled_original = scaler.fit_transform(X_train_full_original)
+X_test = scaler.transform(X_test_full)
+
+# ================================================================
+# STEP 3.1 — BALANCE TRAINING FEATURES AFTER EXTRACTION
+# ================================================================
+
+print("\nSTEP 3.1: Balancing training features after extraction")
+
+X_real = X_train_scaled_original[y_train_original == 0]
+X_fake = X_train_scaled_original[y_train_original == 1]
+
+print(f"Before balancing — Real: {len(X_real)} | Fake: {len(X_fake)}")
+
+if len(X_real) < len(X_fake):
+    X_real_over = resample(
+        X_real,
+        replace=True,
+        n_samples=len(X_fake),
+        random_state=RANDOM_STATE
+    )
+    y_real_over = np.zeros(len(X_real_over), dtype=int)
+    X_train = np.vstack([X_real_over, X_fake])
+    y_train = np.concatenate([y_real_over, np.ones(len(X_fake), dtype=int)])
+elif len(X_fake) < len(X_real):
+    X_fake_over = resample(
+        X_fake,
+        replace=True,
+        n_samples=len(X_real),
+        random_state=RANDOM_STATE
+    )
+    y_fake_over = np.ones(len(X_fake_over), dtype=int)
+    X_train = np.vstack([X_real, X_fake_over])
+    y_train = np.concatenate([np.zeros(len(X_real), dtype=int), y_fake_over])
+else:
+    X_train = X_train_scaled_original
+    y_train = y_train_original
+
+rng = np.random.default_rng(RANDOM_STATE)
+perm = rng.permutation(len(y_train))
+X_train = X_train[perm]
+y_train = y_train[perm]
+
+print(f"After balancing — Real: {(y_train == 0).sum()} | Fake: {(y_train == 1).sum()}")
+print(f"Balanced train shape: {X_train.shape}")
+
+# Save preprocessing summary
+with open(os.path.join(OUTPUT_DIR, "preprocessing_summary.txt"), "w") as f:
+    f.write("PREPROCESSING SUMMARY\n")
+    f.write("=" * 50 + "\n")
+    f.write(f"Original train shape: {X_train_full_original.shape}\n")
+    f.write(f"Test shape: {X_test_full.shape}\n")
+    f.write(f"Original train real: {(y_train_original == 0).sum()}\n")
+    f.write(f"Original train fake: {(y_train_original == 1).sum()}\n")
+    f.write(f"Balanced train real: {(y_train == 0).sum()}\n")
+    f.write(f"Balanced train fake: {(y_train == 1).sum()}\n")
+    f.write(f"Final fused features: {X_train.shape[1]}\n")
+
+# ================================================================
+# STEP 4 — UMAP + PCA VISUALIZATIONS
+# ================================================================
+
+print("\nSTEP 4: UMAP + PCA visualizations")
+
+try:
+    umap_model = umap.UMAP(n_components=2, random_state=RANDOM_STATE)
+    X_umap = umap_model.fit_transform(X_train)
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(X_umap[y_train == 0, 0], X_umap[y_train == 0, 1],
+                alpha=0.65, label="Real", color=PASTEL_BLUE, edgecolors="none")
+    plt.scatter(X_umap[y_train == 1, 0], X_umap[y_train == 1, 1],
+                alpha=0.65, label="Fake", color=PASTEL_PINK, edgecolors="none")
+    plt.legend(frameon=True)
+    plt.title("UMAP — Balanced Train Feature Space", color=DARK, fontweight="bold")
+    plt.xlabel("UMAP-1")
+    plt.ylabel("UMAP-2")
+    plt.grid(True, color=GRID, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "umap_balanced_train.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+except Exception as e:
+    print(f"UMAP skipped due to error: {e}")
+
+# PCA 2D on full balanced fused features
+try:
+    pca_2d = PCA(n_components=2, random_state=RANDOM_STATE)
+    X_pca_2d = pca_2d.fit_transform(X_train)
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(X_pca_2d[y_train == 0, 0], X_pca_2d[y_train == 0, 1],
+                alpha=0.65, label="Real", color=PASTEL_BLUE, edgecolors="none")
+    plt.scatter(X_pca_2d[y_train == 1, 0], X_pca_2d[y_train == 1, 1],
+                alpha=0.65, label="Fake", color=PASTEL_PINK, edgecolors="none")
+    plt.legend(frameon=True)
+    plt.title("PCA — Full Fused Feature Space", color=DARK, fontweight="bold")
+    plt.xlabel(f"PC1 ({pca_2d.explained_variance_ratio_[0]*100:.1f}% var)")
+    plt.ylabel(f"PC2 ({pca_2d.explained_variance_ratio_[1]*100:.1f}% var)")
+    plt.grid(True, color=GRID, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "pca_full_fused_features.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+except Exception as e:
+    print(f"Full PCA plot skipped due to error: {e}")
+
+# PCA per feature group on original extracted features, not oversampled rows
+try:
+    for grp_name, X_grp in train_groups_original.items():
+        X_grp_scaled = StandardScaler().fit_transform(X_grp)
+        pca_grp = PCA(n_components=2, random_state=RANDOM_STATE)
+        X_pca_grp = pca_grp.fit_transform(X_grp_scaled)
+
+        plt.figure(figsize=(6, 5))
+        plt.scatter(X_pca_grp[y_train_original == 0, 0], X_pca_grp[y_train_original == 0, 1],
+                    alpha=0.65, label="Real", color=PASTEL_BLUE, edgecolors="none")
+        plt.scatter(X_pca_grp[y_train_original == 1, 0], X_pca_grp[y_train_original == 1, 1],
+                    alpha=0.65, label="Fake", color=PASTEL_PINK, edgecolors="none")
+        plt.legend(frameon=True)
+        plt.title(f"PCA — {grp_name}", color=DARK, fontweight="bold")
+        plt.xlabel(f"PC1 ({pca_grp.explained_variance_ratio_[0]*100:.1f}% var)")
+        plt.ylabel(f"PC2 ({pca_grp.explained_variance_ratio_[1]*100:.1f}% var)")
+        plt.grid(True, color=GRID, alpha=0.6)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f"pca_{grp_name}.png"), dpi=200, bbox_inches="tight")
+        plt.close()
+except Exception as e:
+    print(f"PCA per feature group skipped due to error: {e}")
+
+# ================================================================
+# STEP 4.1 — PCA EXPLAINED VARIANCE ANALYSIS
+# ================================================================
+
+print("\nSTEP 4.1: PCA explained variance analysis")
+
+try:
+    pca_full = PCA()
+    pca_full.fit(X_train)
+    explained = pca_full.explained_variance_ratio_
+    cumulative = np.cumsum(explained)
+
+    comp_90 = int(np.argmax(cumulative >= 0.90) + 1)
+    comp_95 = int(np.argmax(cumulative >= 0.95) + 1)
+    comp_99 = int(np.argmax(cumulative >= 0.99) + 1)
+
+    print(f"Components for 90% variance: {comp_90}")
+    print(f"Components for 95% variance: {comp_95}")
+    print(f"Components for 99% variance: {comp_99}")
+
+    with open(os.path.join(OUTPUT_DIR, "pca_explained_variance_summary.txt"), "w") as f:
+        f.write("PCA EXPLAINED VARIANCE SUMMARY\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Components for 90% variance: {comp_90}\n")
+        f.write(f"Components for 95% variance: {comp_95}\n")
+        f.write(f"Components for 99% variance: {comp_99}\n")
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(cumulative, color=DEEP_BLUE, linewidth=2.5)
+    plt.axhline(0.90, linestyle="--", color=PASTEL_PINK, label=f"90%: {comp_90} comps")
+    plt.axhline(0.95, linestyle="--", color=DEEP_PINK, label=f"95%: {comp_95} comps")
+    plt.axhline(0.99, linestyle="--", color=DARK, label=f"99%: {comp_99} comps")
+    plt.xlabel("Number of PCA Components")
+    plt.ylabel("Cumulative Explained Variance")
+    plt.title("PCA Explained Variance — Fused Features", color=DARK, fontweight="bold")
+    plt.legend(frameon=True)
+    plt.grid(True, color=GRID, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "pca_explained_variance.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+except Exception as e:
+    print(f"PCA explained variance skipped due to error: {e}")
+
+# ================================================================
+# STEP 5 — LIGHTGBM HYPERPARAMETERS
+# ================================================================
+
+if RUN_HYPERPARAM_TUNING:
+    print("\nSTEP 5: Hyperparameter tuning for LightGBM")
+    from sklearn.model_selection import RandomizedSearchCV
+
+    param_grid = {
+        "n_estimators": [200, 300, 500],
+        "learning_rate": [0.01, 0.03, 0.05, 0.1],
+        "max_depth": [4, 6, 8, -1],
+        "num_leaves": [15, 31, 63],
+        "min_child_samples": [10, 20, 40],
+        "subsample": [0.8, 0.9, 1.0],
+        "colsample_bytree": [0.8, 0.9, 1.0],
+        "reg_alpha": [0, 0.1, 1],
+        "reg_lambda": [0, 0.1, 1, 5]
+    }
+
+    base_model = lgb.LGBMClassifier(
+        random_state=RANDOM_STATE,
+        objective="binary",
+        verbose=-1
+    )
+
+    search = RandomizedSearchCV(
+        estimator=base_model,
+        param_distributions=param_grid,
+        n_iter=15,
+        scoring="roc_auc",
+        cv=3,
+        verbose=1,
+        random_state=RANDOM_STATE,
+        n_jobs=-1
+    )
+
+    search.fit(X_train, y_train)
+    BEST_PARAMS = search.best_params_
+    best_cv_auc = search.best_score_
+else:
+    print("\nSTEP 5: Using precomputed tuned LightGBM parameters")
+    best_cv_auc = 0.9996
+
+print("Best LightGBM parameters:")
+print(BEST_PARAMS)
+print(f"Best CV AUC: {best_cv_auc:.4f}")
+
+with open(os.path.join(OUTPUT_DIR, "best_lightgbm_params.txt"), "w") as f:
+    f.write("Best LightGBM Parameters\n")
+    f.write(str(BEST_PARAMS))
+    f.write(f"\nBest CV AUC: {best_cv_auc:.4f}\n")
+
+# ================================================================
+# STEP 5.1 — TRAIN TUNED LIGHTGBM WITH OVERFITTING CURVES
+# ================================================================
+
+print("\nSTEP 5.1: Training tuned LightGBM with train/validation curves")
+
+model = lgb.LGBMClassifier(
+    **BEST_PARAMS,
+    random_state=RANDOM_STATE,
+    objective="binary",
+    verbose=-1
+)
+
+eval_results = {}
+
+model.fit(
+    X_train,
+    y_train,
+    eval_set=[(X_train, y_train), (X_test, y_test)],
+    eval_names=["train", "valid"],
+    eval_metric="binary_logloss",
+    callbacks=[lgb.record_evaluation(eval_results)]
+)
+
+pred = model.predict(X_test)
+probs = model.predict_proba(X_test)[:, 1]
+
+train_loss = eval_results["train"]["binary_logloss"]
+valid_loss = eval_results["valid"]["binary_logloss"]
+
+# Loss curve
+plt.figure(figsize=(6, 5))
+plt.plot(train_loss, label="Train Loss", color=DEEP_BLUE, linewidth=2.5)
+plt.plot(valid_loss, label="Validation Loss", color=DEEP_PINK, linewidth=2.5)
+plt.xlabel("Boosting Iterations")
+plt.ylabel("Binary Log Loss")
+plt.title("Tuned LightGBM Train vs Validation Loss", color=DARK, fontweight="bold")
+plt.legend(frameon=True)
+plt.grid(True, color=GRID, alpha=0.6)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "lightgbm_loss_curve.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+# Accuracy and error curves
+train_acc, valid_acc = [], []
+for i in range(1, len(train_loss) + 1):
+    train_pred_i = model.predict(X_train, num_iteration=i)
+    valid_pred_i = model.predict(X_test, num_iteration=i)
+    train_acc.append((train_pred_i == y_train).mean())
+    valid_acc.append((valid_pred_i == y_test).mean())
+
+plt.figure(figsize=(6, 5))
+plt.plot(train_acc, label="Train Accuracy", color=DEEP_BLUE, linewidth=2.5)
+plt.plot(valid_acc, label="Validation Accuracy", color=DEEP_PINK, linewidth=2.5)
+plt.xlabel("Boosting Iterations")
+plt.ylabel("Accuracy")
+plt.title("Tuned LightGBM Train vs Validation Accuracy", color=DARK, fontweight="bold")
+plt.legend(frameon=True)
+plt.grid(True, color=GRID, alpha=0.6)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "lightgbm_accuracy_curve.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+train_error = [1 - a for a in train_acc]
+valid_error = [1 - a for a in valid_acc]
+
+plt.figure(figsize=(6, 5))
+plt.plot(train_error, label="Train Error", color=DEEP_BLUE, linewidth=2.5)
+plt.plot(valid_error, label="Validation Error", color=DEEP_PINK, linewidth=2.5)
+plt.xlabel("Boosting Iterations")
+plt.ylabel("Error")
+plt.title("Tuned LightGBM Train vs Validation Error", color=DARK, fontweight="bold")
+plt.legend(frameon=True)
+plt.grid(True, color=GRID, alpha=0.6)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "lightgbm_error_curve.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+# ================================================================
+# STEP 6 — FINAL METRICS
+# ================================================================
+
+print("\n" + "=" * 60)
+print("FINAL TUNED LIGHTGBM RESULTS")
+print("=" * 60)
+
+report_text = classification_report(y_test, pred, target_names=["Real", "Fake"])
+print(report_text)
+
+auc = roc_auc_score(y_test, probs)
+bal_acc = balanced_accuracy_score(y_test, pred)
+acc = accuracy_score(y_test, pred)
+f1 = f1_score(y_test, pred)
+
+print(f"Accuracy     : {acc:.4f}")
+print(f"AUC-ROC      : {auc:.4f}")
+print(f"Balanced Acc : {bal_acc:.4f}")
+print(f"F1-score     : {f1:.4f}")
+
+with open(os.path.join(OUTPUT_DIR, "final_metrics.txt"), "w") as f:
+    f.write("FINAL TUNED LIGHTGBM RESULTS\n")
+    f.write("=" * 60 + "\n")
+    f.write(report_text + "\n")
+    f.write(f"Accuracy     : {acc:.4f}\n")
+    f.write(f"AUC-ROC      : {auc:.4f}\n")
+    f.write(f"Balanced Acc : {bal_acc:.4f}\n")
+    f.write(f"F1-score     : {f1:.4f}\n")
+
+# ================================================================
+# STEP 6.1 — MODEL COMPARISON WITH SPEED + SIZE
+# ================================================================
+
+print("\nSTEP 6.1: Comparing models on 500-sample subset with efficiency metrics")
+
+sample_n = min(250, (y_train == 0).sum(), (y_train == 1).sum())
+X_real_sample = X_train[y_train == 0][:sample_n]
+X_fake_sample = X_train[y_train == 1][:sample_n]
+y_real_sample = np.zeros(sample_n, dtype=int)
+y_fake_sample = np.ones(sample_n, dtype=int)
+X_small = np.vstack([X_real_sample, X_fake_sample])
+y_small = np.concatenate([y_real_sample, y_fake_sample])
+
+rng = np.random.default_rng(RANDOM_STATE)
+perm = rng.permutation(len(y_small))
+X_small = X_small[perm]
+y_small = y_small[perm]
+
+models = {
+    "Logistic Regression": LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
+    "Random Forest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE),
+    "XGBoost": XGBClassifier(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=6,
+        random_state=RANDOM_STATE,
+        eval_metric="logloss"
+    ),
+    "LightGBM": lgb.LGBMClassifier(
+        **BEST_PARAMS,
+        random_state=RANDOM_STATE,
+        objective="binary",
+        verbose=-1
+    )
+}
+
+comparison_results = []
+for name, clf in models.items():
+    print(f"\nTraining {name}...")
+
+    start_train = time.time()
+    clf.fit(X_small, y_small)
+    train_time = time.time() - start_train
+
+    start_pred = time.time()
+    pred_m = clf.predict(X_test)
+    infer_time = time.time() - start_pred
+
+    if hasattr(clf, "predict_proba"):
+        probs_m = clf.predict_proba(X_test)[:, 1]
+        auc_m = roc_auc_score(y_test, probs_m)
+    else:
+        auc_m = np.nan
+
+    acc_m = accuracy_score(y_test, pred_m)
+    bal_m = balanced_accuracy_score(y_test, pred_m)
+    f1_m = f1_score(y_test, pred_m)
+    model_size_mb = len(pickle.dumps(clf)) / (1024 * 1024)
+
+    comparison_results.append([name, acc_m, bal_m, f1_m, auc_m, train_time, infer_time, model_size_mb])
+
+print("\nMODEL COMPARISON RESULTS")
+print("=" * 100)
+print(f"{'Model':<22} {'Acc':<8} {'BalAcc':<8} {'F1':<8} {'AUC':<8} {'Train(s)':<10} {'Infer(s)':<10} {'Size(MB)':<10}")
+for row in comparison_results:
+    print(f"{row[0]:<22} {row[1]:<8.4f} {row[2]:<8.4f} {row[3]:<8.4f} {row[4]:<8.4f} {row[5]:<10.4f} {row[6]:<10.4f} {row[7]:<10.4f}")
+
+with open(os.path.join(OUTPUT_DIR, "model_comparison_speed_size.txt"), "w") as f:
+    f.write("MODEL COMPARISON RESULTS WITH SPEED AND SIZE\n")
+    f.write("=" * 100 + "\n")
+    f.write(f"{'Model':<22} {'Acc':<8} {'BalAcc':<8} {'F1':<8} {'AUC':<8} {'Train(s)':<10} {'Infer(s)':<10} {'Size(MB)':<10}\n")
+    for row in comparison_results:
+        f.write(f"{row[0]:<22} {row[1]:<8.4f} {row[2]:<8.4f} {row[3]:<8.4f} {row[4]:<8.4f} {row[5]:<10.4f} {row[6]:<10.4f} {row[7]:<10.4f}\n")
+
+model_names = [r[0] for r in comparison_results]
+train_times = [r[5] for r in comparison_results]
+infer_times = [r[6] for r in comparison_results]
+model_sizes = [r[7] for r in comparison_results]
+
+plt.figure(figsize=(8, 5))
+plt.bar(model_names, train_times, color=[PASTEL_BLUE, PASTEL_PINK, "#BDE0FE", "#FFC8DD"])
+plt.ylabel("Training Time (seconds)")
+plt.title("Model Training Time Comparison", color=DARK, fontweight="bold")
+plt.xticks(rotation=30, ha="right")
+plt.grid(axis="y", color=GRID, alpha=0.5)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "model_training_time_comparison.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+plt.figure(figsize=(8, 5))
+plt.bar(model_names, infer_times, color=[PASTEL_BLUE, PASTEL_PINK, "#BDE0FE", "#FFC8DD"])
+plt.ylabel("Inference Time on Test Set (seconds)")
+plt.title("Model Inference Time Comparison", color=DARK, fontweight="bold")
+plt.xticks(rotation=30, ha="right")
+plt.grid(axis="y", color=GRID, alpha=0.5)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "model_inference_time_comparison.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+plt.figure(figsize=(8, 5))
+plt.bar(model_names, model_sizes, color=[PASTEL_BLUE, PASTEL_PINK, "#BDE0FE", "#FFC8DD"])
+plt.ylabel("Model Size (MB)")
+plt.title("Model Size Comparison", color=DARK, fontweight="bold")
+plt.xticks(rotation=30, ha="right")
+plt.grid(axis="y", color=GRID, alpha=0.5)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "model_size_comparison.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+# ================================================================
+# STEP 7 — SHAP
+# ================================================================
+
+print("\nSTEP 7: SHAP")
+
+sample_size = min(100, len(X_test))
+X_sample = X_test[:sample_size]
+probs_sample = probs[:sample_size]
+
+explainer = shap.TreeExplainer(model)
+shap_vals = explainer.shap_values(X_sample)
+if isinstance(shap_vals, list):
+    shap_vals = shap_vals[1]
+
+# ================================================================
+# STEP 8 — SAVE MAIN PLOTS
+# ================================================================
+
+print("\nSTEP 8: Saving main plots")
+
+cm = confusion_matrix(y_test, pred)
+save_pastel_confusion_matrix(
+    cm,
+    labels=["Real", "Fake"],
+    path=os.path.join(OUTPUT_DIR, "confusion_pastel.png"),
+    title="Confusion Matrix — Tuned LightGBM"
+)
+
+# Also save normal confusion name for compatibility
+save_pastel_confusion_matrix(
+    cm,
+    labels=["Real", "Fake"],
+    path=os.path.join(OUTPUT_DIR, "confusion.png"),
+    title="Confusion Matrix — Tuned LightGBM"
+)
+
+fpr, tpr, _ = roc_curve(y_test, probs)
+plt.figure(figsize=(6, 5))
+plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}", color=DEEP_BLUE, linewidth=2.5)
+plt.plot([0, 1], [0, 1], linestyle="--", color=DARK, alpha=0.7)
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve — Tuned LightGBM", color=DARK, fontweight="bold")
+plt.legend(frameon=True)
+plt.grid(True, color=GRID, alpha=0.6)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "roc.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+# SHAP summary with proper feature names
+shap.summary_plot(shap_vals, X_sample, feature_names=feature_names, show=False, max_display=20)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "shap.png"), dpi=200, bbox_inches="tight")
+plt.close()
+
+# ================================================================
+# STEP 9 — HUMAN-READABLE EXPLANATIONS
+# ================================================================
+
+print("\nSTEP 9: Human-readable explanations")
+
+def generate_explanation(top_features, prob):
+    reasons = []
+    for name in top_features:
+        if name.startswith("joint_av"):
+            reasons.append("lip movements not matching audio")
+        elif name.startswith("lips") or name.startswith("lip_temporal"):
+            reasons.append("unnatural mouth motion")
+        elif name.startswith("eyes") or name.startswith("ear"):
+            reasons.append("abnormal blinking behaviour")
+        elif name.startswith("flow"):
+            reasons.append("inconsistent motion dynamics")
+        elif name.startswith("audio"):
+            reasons.append("irregular audio patterns")
+        elif name.startswith("spatial_delta"):
+            reasons.append("unnatural facial movement changes")
+
+    reasons = list(set(reasons))
+    if not reasons:
+        reasons = ["subtle high-dimensional inconsistencies"]
+
+    if prob > 0.7:
+        return "Likely FAKE due to " + ", ".join(reasons)
+    elif prob < 0.3:
+        return "Likely REAL with natural " + ", ".join(reasons)
+    else:
+        return "UNCERTAIN — mixed signals including " + ", ".join(reasons)
+
+extreme_fake = np.argmax(probs_sample)
+extreme_real = np.argmin(probs_sample)
+mid_case = np.argsort(np.abs(probs_sample - 0.5))[0]
+
+samples = {
+    "EXTREME_FAKE": extreme_fake,
+    "EXTREME_REAL": extreme_real,
+    "CONFUSING": mid_case
+}
+
+explanation_lines = []
+for label, idx in samples.items():
+    print("\n" + "=" * 50)
+    print(label)
+    print("=" * 50)
+
+    sv = shap_vals[idx, :]
+    top_idx = np.argsort(np.abs(sv))[::-1][:5]
+    top_features = [feature_names[i] for i in top_idx]
+    explanation = generate_explanation(top_features, probs_sample[idx])
+
+    line = (
+        f"{label}\n"
+        f"Probability fake: {probs_sample[idx]:.4f}\n"
+        f"Top features: {top_features}\n"
+        f"Explanation: {explanation}\n"
+    )
+    explanation_lines.append(line)
+
+    print(f"Probability (fake): {probs_sample[idx]:.4f}")
+    print(f"Top features       : {top_features}")
+    print(f"Explanation        : {explanation}")
+
+with open(os.path.join(OUTPUT_DIR, "human_readable_explanations.txt"), "w") as f:
+    f.write("\n".join(explanation_lines))
+
+print(f"\nDONE — everything saved in /{OUTPUT_DIR}/")
