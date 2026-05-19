@@ -8,7 +8,7 @@ A multimodal deepfake detection framework that moves beyond visual appearance an
 
 Recent advances in generative AI have enabled highly realistic deepfake videos capable of mimicking facial expressions, speech, and human behaviour. Traditional visual-only detection methods often fail when synthetic media becomes photorealistic.
 
-This project proposes a behaviour-aware multimodal deepfake detection pipeline that focuses on:
+This Machine Learning & Pattern Recognition project proposes a behaviour-aware multimodal deepfake detection pipeline that focuses on:
 
 * Eye-blink behaviour
 * Lip movement consistency
